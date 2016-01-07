@@ -14,8 +14,14 @@ class StuffToDo < ActiveRecord::Base
   belongs_to :stuff, :polymorphic => true
   belongs_to :user
   acts_as_list :scope => :user
-  
-  if Rails::VERSION::MAJOR >= 3
+
+  if Rails::VERSION::MAJOR >= 4
+    scope :doing_now, ->(user) {
+      where(user_id: user.id).
+      order(position: :asc).
+      limit(5)
+    }
+  elsif Rails::VERSION::MAJOR >= 3
     scope :doing_now, lambda { |user|
       {
         :conditions => { :user_id => user.id },
@@ -32,15 +38,21 @@ class StuffToDo < ActiveRecord::Base
       }
     }
   end
-  
+
   # TODO: Rails bug
   #
-  # ActiveRecord ignores :offset if :limit isn't added also.  But since we 
+  # ActiveRecord ignores :offset if :limit isn't added also.  But since we
   # want all the records, we need to provide a limit that will include everything
   #
   # http://dev.rubyonrails.org/ticket/7257
   #
-  if Rails::VERSION::MAJOR >= 3
+  if Rails::VERSION::MAJOR >= 4
+    scope :recommended, ->(user) {
+      where(user_id: user.id).
+      order(position: :asc).
+      offset(5)
+    }
+  elsif Rails::VERSION::MAJOR >= 3
     scope :recommended, lambda { |user|
       {
         :conditions => { :user_id => user.id },
@@ -59,7 +71,7 @@ class StuffToDo < ActiveRecord::Base
       }
     }
   end
-  
+
   # Filters the issues that are available to be added for a user.
   #
   # A filter can be a record:
@@ -68,21 +80,30 @@ class StuffToDo < ActiveRecord::Base
   # * IssueStatus - issues with this status
   # * IssuePriority - issues with this priority
   #
-  def self.available(user, filter=nil)
+  def self.available(user, project, filter=nil)
     return [] if filter.blank?
 
     if filter.is_a?(Project)
-      potential_stuff_to_do = active_and_visible_projects.sort
+      potential_stuff_to_do = active_and_visible_projects(user).sort
     else
-      potential_stuff_to_do = Issue.find(:all,
-                                         :include => [:status, :priority, :project],
-                                         :conditions => conditions_for_available(filter),
-                                         :order => "#{Issue.table_name}.created_on DESC")
+      if User.current.allowed_to?(:view_all_reportee_issues, nil, { :global => true }) or (User == User.current)
+        visible_issues =  Issue
+      else
+        visible_issues =  Issue.visible
+      end
+
+      potential_stuff_to_do = visible_issues.includes(:project, :status, :priority)
+                                            .where(conditions_for_available(user, filter, project))
+                                            .order(created_on: :desc)
     end
 
-    stuff_to_do = StuffToDo.find(:all, :conditions => { :user_id => user.id }).collect(&:stuff)
-    
+    stuff_to_do = StuffToDo.where(:user_id => user.id).collect(&:stuff)
+
     return potential_stuff_to_do - stuff_to_do
+  end
+
+  def self.assigned(user)
+    return StuffToDo.where(user_id: user.id).collect(&:stuff)
   end
 
   def self.using_projects_as_items?
@@ -109,13 +130,13 @@ class StuffToDo < ActiveRecord::Base
 
       if threshold && threshold.to_i >= count
         user = User.find_by_id(user_id)
-        StuffToDoMailer.deliver_recommended_below_threshold(user, count)
+        StuffToDoMailer.recommended_below_threshold(user, count).deliver
       end
     end
-    
+
     return true
   end
-  
+
   # Destroys all +NextIssues+ on an +issue+ that are not the assigned to user
   def self.remove_stale_assignments(issue)
     if issue.assigned_to_id.nil?
@@ -126,7 +147,7 @@ class StuffToDo < ActiveRecord::Base
                              issue.assigned_to_id])
     end
   end
-  
+
   # Reorders the list of StuffToDo items for +user+ to be in the order of
   # +ids+.  New StuffToDos will be created if needed and old
   # StuffToDos will be removed if they are unassigned.
@@ -157,6 +178,15 @@ class StuffToDo < ActiveRecord::Base
     reorder_projects(user, project_ids)
   end
 
+  def self.available_status?(issue)
+    return true if Setting.plugin_stuff_to_do_plugin['statuses_for_stuff_to_do'].nil?
+    ( Setting.plugin_stuff_to_do_plugin['statuses_for_stuff_to_do'] & ['all', issue.status] ).size > 0
+  end
+
+  def self.unavailable_status?(issue)
+    !self.available_status?(issue)
+  end
+
   private
 
   def self.reorder_issues(user, issue_ids)
@@ -168,7 +198,7 @@ class StuffToDo < ActiveRecord::Base
   end
 
   def self.reorder_items(type, user, ids)
-    list = self.find_all_by_user_id_and_stuff_type(user.id, type)
+    list = self.where(user_id: user.id, stuff_type: type)
     stuff_to_dos_found = list.collect { |std| std.stuff_id.to_i }
 
     remove_missing_records(user, stuff_to_dos_found, ids.values)
@@ -186,13 +216,13 @@ class StuffToDo < ActiveRecord::Base
         stuff_to_do.user_id = user.id
 
         stuff_to_do.save # TODO: Check return
-        
+
         # Have to resave next_issue since acts_as_list automatically moves it
         # to the bottom on create
         stuff_to_do.insert_at(position + 1)  # acts_as_list is 1 based
       end
     end
-  
+
   end
 
   # Destroys saved records that are +ids_found_in_database+ but are
@@ -200,35 +230,60 @@ class StuffToDo < ActiveRecord::Base
   def self.remove_missing_records(user, ids_found_in_database, ids_to_use)
     removed = ids_found_in_database - ids_to_use
     removed.each do |id|
-      removed_stuff_to_do = self.find_by_user_id_and_stuff_id(user.id, id)
-      removed_stuff_to_do.destroy
+      removed_stuff_to_do = self.where(user_id: user.id, stuff_id: id)
+      removed_stuff_to_do.destroy_all
     end
   end
 
-  # Redmine 0.8.x compatibility method.
-  def self.active_and_visible_projects
-    if ::Project.respond_to?(:active) && ::Project.respond_to?(:visible)
-      return ::Project.active.visible
-    else
-      return ::Project.find(:all, :conditions => Project.visible_by)
+  def self.remove(user_id, id)
+    removed_stuff_to_do = self.where(user_id: user_id, stuff_id: id)
+    removed_stuff_to_do.destroy_all
+  end
+
+  def self.add(user_id, id, to_front)
+    if not (where(user_id: user_id, stuff_id: id).exists?) #make sure it's not already there
+      stuff_to_do = self.new
+      stuff_to_do.stuff_id = id
+      stuff_to_do.stuff_type = 'Issue'
+      stuff_to_do.user_id = user_id
+      stuff_to_do.save # TODO: Check return
+
+      if to_front == true
+        stuff_to_do.insert_at(1)
+      end
     end
+  end
+
+  def self.active_and_visible_projects(user=User.current)
+    projects = Project.active.where(Project.visible_condition(user))
+    if !User.current.allowed_to_globally?(:view_all_reportee_issues, {}) and (user != User.current)
+      projects = projects.where(Project.visible_condition(User.current))
+    end
+    projects
   end
 
   def self.use_setting
     USE.key(Setting.plugin_stuff_to_do_plugin['use_as_stuff_to_do'])
   end
 
-  def self.conditions_for_available(filter_by)
+  def self.conditions_for_available(user, filter_by, project)
     scope = self
-    conditions = "#{IssueStatus.table_name}.is_closed = 0::boolean"
-    conditions << " AND (" << "#{Project.table_name}.status = %d" % [Project::STATUS_ACTIVE] << ")"
-    case 
-    when filter_by.is_a?(User)
-      conditions << " AND (" << "assigned_to_id = %d" % [filter_by.id] << ")"
+    conditions = { "#{IssueStatus.table_name}.is_closed" => false }
+    trackers = Setting.plugin_stuff_to_do_plugin['statuses_for_stuff_to_do']
+    if not trackers.nil? and not trackers.include? 'all'
+      conditions["#{IssueStatus.table_name}.id"] = "#{Setting.plugin_stuff_to_do_plugin['statuses_for_stuff_to_do'].join(',')}))"
+    end
+
+    conditions["projects"] = {"status" => Project::STATUS_ACTIVE}
+    conditions["assigned_to_id"] = user.id
+    conditions["assigned_to_id"] = [user.id] + user.group_ids if(user.is_a?(User))
+
+    case
     when filter_by.is_a?(IssueStatus), filter_by.is_a?(Enumeration)
       table_name = filter_by.class.table_name
-      conditions << " AND (" << "#{table_name}.id = (%d)" % [filter_by.id] << ")"
+      conditions["#{table_name}.id"] = filter_by.id
     end
+    conditions["#{Issue.table_name}.project_id"] = project.id unless project.nil?
     conditions
   end
 end

@@ -33,6 +33,16 @@ module StuffToDoHelper
     
     return html
   end
+  
+  def project_options(projects, selected = nil)
+    html = options_for_select([[l(:label_project_all), '']]) # Blank
+
+    html << project_tree_options_for_select(projects, :selected => selected) do |p|
+      { :value => p.id }
+    end      
+    
+    return html
+  end
 
   # Returns the stuff for a collection of StuffToDo items, removing anything
   # that have been deleted.
@@ -50,39 +60,57 @@ module StuffToDoHelper
     stuff_to_do_items.reject {|item| item.class != Issue }
   end
 
-  def total_hours_for_user_on_day(issue, user, date)
-    total = issue.time_entries.inject(0.0) {|sum, time_entry|
-      if time_entry.user_id == user.id && time_entry.spent_on == date
-        sum += time_entry.hours
+  def stuff_to_do_to_csv(doing_now, recommended, available, user, options={})
+    decimal_separator = l(:general_csv_decimal_separator)
+    encoding = l(:general_csv_encoding)
+    
+    stuff_to_dos = stuff_for(doing_now + recommended)
+    columns = [ l(:field_project), l(:field_tracker), l(:field_status), l(:field_priority), l(:field_subject)]
+    if options[:description]
+      columns << l(:field_description)
+    end
+  
+    export = FCSV.generate(:col_sep => l(:general_csv_separator)) do |csv|
+      # csv title
+      csv << [ l(:stuff_to_do_title) ]
+      csv << [ l(:field_user) + ": " + user.name ]
+      
+      subtitles = [l(:stuff_to_do_what_im_doing_now), l(:stuff_to_do_what_is_recommended)]
+      
+      if options[:available]
+        subtitles << l(:stuff_to_do_what_is_available)
       end
-      sum
-    }
 
-    total != 0.0 ? total : nil
-  end
-
-  def total_hours_for_issue_for_user(issue, user)
-    total = issue.time_entries.inject(0.0) {|sum, time_entry|
-      if time_entry.user_id == user.id
-        sum += time_entry.hours
+      subtitles.each do |subtitle|      
+        csv <<  [ '' ]
+        csv << [ subtitle ]
+        if subtitle == l(:stuff_to_do_what_im_doing_now)
+          stuff_to_dos = stuff_for(doing_now)
+        elsif subtitle == l(:stuff_to_do_what_is_recommended)
+          stuff_to_dos = stuff_for(recommended)
+        else
+          stuff_to_dos = available
+        end
+        
+        # csv header fields
+        csv << [ "#" ] + columns.collect {|c| Redmine::CodesetUtil.from_utf8(c, encoding) }
+        # csv lines
+        stuff_to_dos.each do |stuff|
+          if (stuff.kind_of? Issue)
+            col_values = [ stuff.project.name, stuff.tracker, stuff.status.to_s, stuff.priority.to_s, stuff.subject ]
+            if options[:description]
+              col_values << stuff.description
+            end
+            id = stuff.id.to_s
+          else
+            col_values = [ stuff.name, '', '', '', '' ]
+            id = ''
+          end
+          csv << [ id ] + col_values.collect {|c| Redmine::CodesetUtil.from_utf8(c.to_s, encoding) }
+        end
       end
-      sum
-    }
-    total
+    end
+    export
   end
-
-  def total_hours_for_date(issues, user, date)
-    issues.collect {|issue| total_hours_for_user_on_day(issue, user, date)}.compact.sum
-  end
-
-  def total_hours_for_user(issues, user)
-    issues.collect {|issue| total_hours_for_issue_for_user(issue, user)}.compact.sum
-  end
-
-  # Redmine 0.8.x compatibility
-  def l_hours(hours)
-    hours = hours.to_f
-    l((hours < 2.0 ? :label_f_hour : :label_f_hour_plural), ("%.2f" % hours.to_f))
-  end unless Object.method_defined?('l_hours')
 
 end
